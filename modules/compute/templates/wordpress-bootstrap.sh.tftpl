@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly MARKER="/var/lib/wordpress-bootstrap.done"
+readonly WORDPRESS_VERSION="${wordpress_version}"
+readonly WORDPRESS_SHA256="${wordpress_sha256}"
+readonly ARCHIVE="/tmp/wordpress-$WORDPRESS_VERSION.tar.gz"
+readonly DOWNLOAD_URL="https://downloads.wordpress.org/release/wordpress-$WORDPRESS_VERSION.tar.gz"
+readonly DB_PASSWORD_FILE="/etc/wordpress-db-password"
+
+if [[ -f "$MARKER" ]]; then
+  exit 0
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates \
+  curl \
+  default-mysql-client \
+  nginx \
+  php-curl \
+  php-fpm \
+  php-gd \
+  php-intl \
+  php-mbstring \
+  php-mysql \
+  php-xml \
+  php-zip \
+  rsync
+
+PHP_FPM_SERVICE="$(
+  find /usr/lib/systemd/system /lib/systemd/system \
+    -maxdepth 1 \
+    -type f \
+    -name 'php*-fpm.service' \
+    -printf '%f\n' 2>/dev/null |
+    sort -Vu |
+    tail -1
+)"
+if [[ -z "$PHP_FPM_SERVICE" ]]; then
+  echo "Unable to locate PHP-FPM service" >&2
+  exit 1
+fi
+
+systemctl enable --now "$PHP_FPM_SERVICE"
+PHP_SOCKET="$(find /run/php -maxdepth 1 -type s -name 'php*-fpm.sock' | sort | tail -1)"
+if [[ -z "$PHP_SOCKET" ]]; then
+  echo "Unable to locate PHP-FPM socket" >&2
+  exit 1
+fi
+
+install -m 0640 -o root -g www-data /dev/null "$DB_PASSWORD_FILE"
+printf '%s' '${database_password_base64}' | base64 --decode >"$DB_PASSWORD_FILE"
+DB_PASSWORD="$(cat "$DB_PASSWORD_FILE")"
+
+for attempt in $(seq 1 60); do
+  if MYSQL_PWD="$DB_PASSWORD" mysqladmin ping \
+    --connect-timeout=5 \
+    --host='${database_host}' \
+    --port='${database_port}' \
+    --user='${database_username}' \
+    --silent; then
+    break
+  fi
+  if [[ "$attempt" -eq 60 ]]; then
+    echo "RDS MySQL did not become reachable in time" >&2
+    exit 1
+  fi
+  sleep 10
+done
+unset DB_PASSWORD
+
+install -d -o www-data -g www-data /var/www/wordpress
+
+if [[ ! -f /var/www/wordpress/wp-settings.php ]]; then
+  curl --fail --location --retry 8 --retry-delay 5 \
+    "$DOWNLOAD_URL" \
+    --output "$ARCHIVE"
+  echo "$WORDPRESS_SHA256  $ARCHIVE" | sha256sum --check -
+  rm -rf /tmp/wordpress
+  tar -xzf "$ARCHIVE" -C /tmp
+  rsync -a /tmp/wordpress/ /var/www/wordpress/
+  rm -rf /tmp/wordpress "$ARCHIVE"
+fi
+
+if [[ ! -f /var/www/wordpress/wp-config.php ]]; then
+  cat >/var/www/wordpress/wp-config.php <<'PHP_CONFIG'
+<?php
+define( 'DB_NAME', '${database_name}' );
+define( 'DB_USER', '${database_username}' );
+define( 'DB_PASSWORD', trim( file_get_contents( '/etc/wordpress-db-password' ) ) );
+define( 'DB_HOST', '${database_host}:${database_port}' );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+PHP_CONFIG
+  curl --fail --location --retry 5 \
+    https://api.wordpress.org/secret-key/1.1/salt/ \
+    >>/var/www/wordpress/wp-config.php
+  cat >>/var/www/wordpress/wp-config.php <<'PHP_CONFIG'
+$table_prefix = 'wp_';
+define( 'FS_METHOD', 'direct' );
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+require_once ABSPATH . 'wp-settings.php';
+PHP_CONFIG
+fi
+
+chown -R www-data:www-data /var/www/wordpress
+find /var/www/wordpress -type d -exec chmod 0755 {} \;
+find /var/www/wordpress -type f -exec chmod 0644 {} \;
+chmod 0640 /var/www/wordpress/wp-config.php
+
+cat >/etc/nginx/sites-available/wordpress <<NGINX
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    root /var/www/wordpress;
+    index index.php index.html;
+    client_max_body_size 32m;
+
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:$PHP_SOCKET;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}
+NGINX
+
+rm -f /etc/nginx/sites-enabled/default
+ln -sfn /etc/nginx/sites-available/wordpress /etc/nginx/sites-enabled/wordpress
+nginx -t
+systemctl enable --now nginx
+systemctl restart "$PHP_FPM_SERVICE" nginx
+
+touch "$MARKER"
